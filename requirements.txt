@@ -8,3 +8,6 @@ numpy==2.2.6
 
 # Downstream zero-shot tasks (arc, boolq, piqa, rte, ...)
 lm_eval>=0.4.0
+
+# Optional experiment logging (only needed with --wandb)
+wandb>=0.16
