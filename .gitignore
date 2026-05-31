@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# quantized model artifacts and eval outputs
+out/
+quantized_models/
+*.safetensors
+*.bin
+
+# datasets / caches
+*_cache/
+calibration_cache/
+.cache/
+
+# env
+.venv/
+venv/
+.env

@@ -1,0 +1,107 @@
+"""AWQ (standard AutoAWQ recipe) with optional SNC.
+
+Per linear:
+  1. scale search: s = (x_mean^r / w_mean^(1-r)), normalized, r grid-searched
+     on output MSE  (x_mean = E|X|, w_mean = mean of group-normalized |W|).
+  2. weight clip search: per (out-channel, group) shrink of |W| range,
+     chosen by output MSE  (AutoAWQ _search_best_clip).
+  3. quantize the scaled+clipped weight; if use_snc, run the verified SNC
+     correction in the scaled space, else plain group-wise asym RTN.
+"""
+import torch
+import snc_core as C
+
+
+@torch.no_grad()
+def _q_group(Wg, bits):
+    """Group-wise asym quant-dequant; Wg: (..., group_size)."""
+    mx = Wg.amax(-1, keepdim=True); mn = Wg.amin(-1, keepdim=True)
+    maxi = 2 ** bits - 1
+    sc = ((mx - mn) / maxi).clamp(min=1e-8)
+    zp = torch.round(-mn / sc).clamp(0, maxi)
+    return (torch.round(Wg / sc + zp).clamp(0, maxi) - zp) * sc
+
+
+@torch.no_grad()
+def _scale_search(W, X, bits, group_size, n_grid, n_mse=512):
+    out_f, in_f = W.shape
+    g = in_f // group_size
+    x_mean = X.abs().mean(0)                                   # E|X|  [in]
+    Wg = W.view(out_f, g, group_size)
+    w_scale = Wg.abs() / (Wg.abs().amax(-1, keepdim=True) + 1e-6)
+    w_mean = w_scale.view(out_f, in_f).mean(0)                 # [in]
+    idx = torch.randperm(X.shape[0])[:n_mse]
+    Xs = X[idx]; Y = Xs @ W.t()
+    best = (float("inf"), None, None)
+    for gi in range(n_grid + 1):
+        r = gi / n_grid
+        s = (x_mean.pow(r) / (w_mean.pow(1 - r) + 1e-4)).clamp(min=1e-4)
+        s = s / (s.max() * s.min()).sqrt()
+        Wq = C.dequant(*C.rtn_quantize(W * s, bits, group_size)) / s
+        err = (Y - Xs @ Wq.t()).pow(2).mean().item()
+        if err < best[0]:
+            best = (err, r, s.clone())
+    return best[2], best[1]
+
+
+@torch.no_grad()
+def _clip_search(Ws, X_scaled, bits, group_size, n_grid=20, max_shrink=0.5,
+                 n_tok=128, out_chunk=128):
+    """Search per-(out,group) clip on the scaled weight Ws by output MSE.
+    Returns clamped Ws (same shape)."""
+    out_f, in_f = Ws.shape
+    g = in_f // group_size
+    idx = torch.randperm(X_scaled.shape[0])[:n_tok]
+    inp = X_scaled[idx].view(-1, g, group_size)               # [t, g, gs]
+    Wsg = Ws.view(out_f, g, group_size)
+    org_max = Wsg.abs().amax(-1, keepdim=True)                # [out, g, 1]
+    best_max = org_max.clone()
+    for ci in range(0, out_f, out_chunk):
+        w = Wsg[ci:ci + out_chunk]                            # [oc, g, gs]
+        omax = org_max[ci:ci + out_chunk]
+        org_out = torch.einsum('tgk,ogk->otg', inp, w)        # [oc, t, g]
+        best_err = torch.full((w.shape[0], g), float("inf"), device=Ws.device)
+        bmax = omax.clone()
+        steps = max(1, int(n_grid * max_shrink))
+        for i in range(steps):
+            mv = omax * (1 - i / n_grid)                      # [oc, g, 1]
+            q = _q_group(torch.clamp(w, -mv, mv), bits)
+            cur = torch.einsum('tgk,ogk->otg', inp, q)
+            err = (cur - org_out).pow(2).mean(1)              # [oc, g]
+            upd = err < best_err
+            best_err = torch.where(upd, err, best_err)
+            bmax = torch.where(upd.unsqueeze(-1), mv, bmax)
+        best_max[ci:ci + out_chunk] = bmax
+    return torch.clamp(Wsg, -best_max, best_max).view(out_f, in_f)
+
+
+@torch.no_grad()
+def awq_quantize_linear(W, X, bits=4, group_size=128, n_grid=20,
+                        use_snc=True, p=0.05, lam=1.0, beta=1.0, clip=True):
+    """W: (out, in) fp. X: (N, in) calibration input. Returns fake-quant W, info."""
+    dev = W.device
+    W = W.float(); X = X.float().to(dev)
+    mu, Sigma, _, _ = C.block_stats(X)
+
+    scales, alpha = _scale_search(W, X, bits, group_size, n_grid)
+    Ws = W * scales
+    if clip:
+        Ws = _clip_search(Ws, X / scales, bits, group_size, n_grid)
+
+    out_f = W.shape[0]
+    if use_snc:
+        mu_s = mu / scales
+        inv = 1.0 / scales
+        Sigma_s = Sigma * inv[None, :] * inv[:, None]
+        A = Sigma_s.abs()
+        sd_s = torch.diagonal(Sigma_s).clamp(min=0.0)
+        r_s = A.sum(1) - torch.diagonal(A)
+        asig, anoi = C.alpha_standalone(out_f, dev, torch.float32)
+        spec = C.MatrixSpec(Ws, bits, group_size, mu_s, Sigma_s, sd_s, r_s, asig, anoi)
+        res = C.snc_correct_block([spec], p=p, lam=lam, beta=beta)[0]
+        Wq = res["W_corrected"] / scales
+        info = {"alpha": alpha, "n_flips": res["n_flips"], "G": res["G"]}
+    else:
+        Wq = C.dequant(*C.rtn_quantize(Ws, bits, group_size)) / scales
+        info = {"alpha": alpha, "n_flips": 0, "G": 0.0}
+    return Wq, info

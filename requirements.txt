@@ -1,0 +1,10 @@
+# Versions verified in the llm_quant env (CUDA 12.8 build of torch).
+# Install torch matching your CUDA from https://pytorch.org if the +cu128 build is unavailable.
+torch==2.9.0
+transformers==4.57.1
+datasets==4.4.1
+accelerate==1.11.0
+numpy==2.2.6
+
+# Downstream zero-shot tasks (arc, boolq, piqa, rte, ...)
+lm_eval>=0.4.0
