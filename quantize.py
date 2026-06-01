@@ -41,30 +41,33 @@ def quantize_model(model, calib, bits, group_size, use_snc, p, device):
     cap = layers[0]; layers[0] = cap.layer
     inps, kwargs = cap.inps, cap.kwargs
     model.model.embed_tokens.cpu()
+    inps = [x.cpu() for x in inps]   # keep calibration inputs on CPU
 
     for li, layer in enumerate(layers):
         layer.to(device)
         lins = _linears(layer)
         caught = {n: [] for n in lins}
-        hooks = [m.register_forward_hook(
-            lambda _m, i, _o, n=n: caught[n].append(i[0].detach().reshape(-1, i[0].shape[-1])))
+        hooks = [m.register_forward_hook(   # store captured activations on CPU
+            lambda _m, i, _o, n=n: caught[n].append(i[0].detach().reshape(-1, i[0].shape[-1]).cpu()))
             for n, m in lins.items()]
         for x in inps:
-            layer(x, **kwargs)
+            layer(x.to(device), **kwargs)
         for h in hooks: h.remove()
 
         for n, m in lins.items():
             X = torch.cat(caught[n], 0)
             if X.shape[0] > MAX_STAT_TOKENS:
                 X = X[torch.randperm(X.shape[0])[:MAX_STAT_TOKENS]]
-            Wq, info = awq_quantize_linear(m.weight.data, X, bits, group_size, use_snc=use_snc, p=p)
+            Wq, info = awq_quantize_linear(m.weight.data, X.to(device), bits, group_size,
+                                           use_snc=use_snc, p=p)
             m.weight.data = Wq.to(m.weight.dtype)
-            del X
+            caught[n].clear(); del X
         caught.clear()
 
         def _fwd(x):
-            o = layer(x, **kwargs)
-            return o[0] if isinstance(o, tuple) else o
+            o = layer(x.to(device), **kwargs)
+            o = o[0] if isinstance(o, tuple) else o
+            return o.cpu()
 
         inps = [_fwd(x) for x in inps]   # outputs feed next layer
         layer.cpu(); torch.cuda.empty_cache(); gc.collect()
