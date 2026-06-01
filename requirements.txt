@@ -11,3 +11,6 @@ lm_eval>=0.4.0
 
 # Optional experiment logging (only needed with --wandb)
 wandb>=0.16
+
+# Mistral/Llama tokenizers
+sentencepiece>=0.2
