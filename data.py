@@ -4,7 +4,9 @@ from datasets import load_dataset
 
 
 def get_calib(tokenizer, n_samples=128, seqlen=2048, seed=42, dataset="c4"):
-    """Return a list of (1, seqlen) token tensors, randomly sliced from docs."""
+    """Return a list of (1, seqlen) token tensors, randomly sliced from docs.
+    Concatenates documents until a full seqlen window is available (standard
+    GPTQ/AWQ practice), so short-document corpora still yield enough samples."""
     g = torch.Generator().manual_seed(seed)
     if dataset == "c4":
         ds = load_dataset("allenai/c4", "en", split="train", streaming=True)
@@ -13,13 +15,17 @@ def get_calib(tokenizer, n_samples=128, seqlen=2048, seed=42, dataset="c4"):
         ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
         texts = (t for t in ds["text"] if len(t) > 0)
 
-    out = []
+    out, buf = [], []
+    buf_len = 0
     for text in texts:
         ids = tokenizer(text, return_tensors="pt").input_ids
-        if ids.shape[1] <= seqlen:
+        buf.append(ids); buf_len += ids.shape[1]
+        if buf_len <= seqlen:
             continue
-        i = int(torch.randint(0, ids.shape[1] - seqlen, (1,), generator=g))
-        out.append(ids[:, i:i + seqlen])
+        cat = torch.cat(buf, dim=1)
+        i = int(torch.randint(0, cat.shape[1] - seqlen, (1,), generator=g))
+        out.append(cat[:, i:i + seqlen])
+        buf, buf_len = [], 0
         if len(out) >= n_samples:
             break
     return out
