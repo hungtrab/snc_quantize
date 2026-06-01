@@ -40,6 +40,8 @@ def quantize_model(model, calib, bits, group_size, use_snc, p, device):
         except StopIteration: pass
     cap = layers[0]; layers[0] = cap.layer
     inps, kwargs = cap.inps, cap.kwargs
+    kwargs.pop("past_key_values", None)   # don't accumulate KV cache across calib samples
+    kwargs["use_cache"] = False
     model.model.embed_tokens.cpu()
     inps = [x.cpu() for x in inps]   # keep calibration inputs on CPU
 
