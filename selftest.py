@@ -4,7 +4,9 @@ Self-test for the SNC core.
   (1) Proposition 1: the value-greedy step never increases the signal-side bias,
       so G >= 0 and |b'_j| <= |b_j| for every channel. This is the guarantee the
       old code violated (it minimized |b - cum| instead of |b + cum|).
-  (2) torch <-> JAX numeric parity on the same synthetic block (skipped if JAX
+  (2) SNC decreases the empirical standalone reconstruction error on synthetic
+      blocks. This catches over-shrinking mu_hat in the James-Stein estimator.
+  (3) torch <-> JAX numeric parity on the same synthetic block (skipped if JAX
       is not installed).
 
 Run:  python selftest.py
@@ -51,8 +53,29 @@ def test_prop1():
     return ok
 
 
+def test_reconstruction_descent():
+    print("[2] standalone reconstruction descent")
+    ok = True
+    for seed in range(5):
+        m = make_block(seed)
+        W_int, scale, zp = ct.rtn_quantize(m.W, m.bits, m.group_size)
+        W_base = ct.dequant(W_int, scale, zp)
+        W_new = ct.snc_correct_block([m], p=0.05)[0]["W_corrected"]
+        g = torch.Generator().manual_seed(seed)
+        _ = torch.randn(m.W.shape, generator=g)
+        X = torch.randn(4096, m.W.shape[1], generator=g)
+        X[:, torch.arange(0, m.W.shape[1], 17)] += 3.0
+        R_base = (X @ (W_base - m.W).t()).pow(2).mean()
+        R_new = (X @ (W_new - m.W).t()).pow(2).mean()
+        descent = R_new <= R_base
+        print(f"  seed={seed}: R={R_base:.6f} -> {R_new:.6f}")
+        ok = ok and bool(descent)
+    print("  -> PASS" if ok else "  -> FAIL")
+    return ok
+
+
 def test_parity():
-    print("[2] torch <-> JAX parity")
+    print("[3] torch <-> JAX parity")
     try:
         import jax.numpy as jnp
         import core_jax as cj
@@ -76,5 +99,6 @@ def test_parity():
 
 if __name__ == "__main__":
     a = test_prop1()
-    b = test_parity()
-    raise SystemExit(0 if (a and b) else 1)
+    b = test_reconstruction_descent()
+    c = test_parity()
+    raise SystemExit(0 if (a and b and c) else 1)

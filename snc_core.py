@@ -21,7 +21,7 @@ Tensor = torch.Tensor
 
 
 # --- Eq. 13: James-Stein shrinkage of the activation mean -------------------
-def james_stein(x_bar: Tensor) -> Tensor:
+def james_stein(x_bar: Tensor, variance_estimate: Tensor | None = None) -> Tensor:
     d = x_bar.shape[0]
     if d < 3:
         return x_bar
@@ -30,7 +30,9 @@ def james_stein(x_bar: Tensor) -> Tensor:
     ss = dev.pow(2).sum()
     if ss < 1e-12:
         return x_bar
-    var = dev.pow(2).mean()                      # sigma_hat^2
+    if variance_estimate is None:
+        variance_estimate = dev.pow(2).mean()
+    var = variance_estimate.clamp(min=0.0)       # sigma_hat^2 of the sample mean
     c = ((d - 2) * var / ss).clamp(0.0, 1.0)
     return grand + (1.0 - c) * dev               # mu_hat
 
@@ -42,7 +44,10 @@ def block_stats(X: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     N = X.shape[0]
     mu = X.mean(0)
     Sigma = (X.t() @ X) / N - torch.outer(mu, mu)
-    mu = james_stein(mu)
+    # James-Stein observes x_bar, so its noise is Var[x_bar] = Var[x] / N.
+    # Using variance across x_bar coordinates would force c ~= (d - 2) / d
+    # regardless of calibration quality and collapse almost the entire mean.
+    mu = james_stein(mu, torch.diagonal(Sigma).clamp(min=0.0).mean() / N)
     sigma_diag = torch.diagonal(Sigma).clamp(min=0.0)
     A = Sigma.abs()
     r = A.sum(1) - torch.diagonal(A)
