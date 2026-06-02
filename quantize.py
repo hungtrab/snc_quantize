@@ -27,7 +27,8 @@ class _Catcher(nn.Module):
 
 
 @torch.no_grad()
-def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42):
+def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42,
+                   lam=1.0, beta=1.0, snc_guard=True):
     # AWQ token subsampling uses torch.randperm in this function and in awq.py.
     # Reset once per quantization run so independently launched AWQ/SNC runs
     # see the same calibration subsets.
@@ -35,6 +36,7 @@ def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     layers = model.model.layers
+    accepted = rejected = 0
     model.model.embed_tokens.to(device)
     if hasattr(model.model, "rotary_emb") and model.model.rotary_emb is not None:
         model.model.rotary_emb.to(device)
@@ -67,7 +69,11 @@ def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42):
             if X.shape[0] > MAX_STAT_TOKENS:
                 X = X[torch.randperm(X.shape[0])[:MAX_STAT_TOKENS]]
             Wq, info = awq_quantize_linear(m.weight.data, X.to(device), bits, group_size,
-                                           use_snc=use_snc, p=p)
+                                           use_snc=use_snc, p=p, lam=lam, beta=beta,
+                                           snc_guard=snc_guard)
+            if info["snc_accepted"] is not None:
+                accepted += int(info["snc_accepted"])
+                rejected += int(not info["snc_accepted"])
             m.weight.data = Wq.to(m.weight.dtype)
             caught[n].clear(); del X
         caught.clear()
@@ -81,6 +87,8 @@ def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42):
         layer.cpu(); torch.cuda.empty_cache(); gc.collect()
         print(f"  layer {li+1}/{len(layers)} done", flush=True)
     model.cpu(); torch.cuda.empty_cache(); gc.collect()   # uniform device for save/eval
+    if use_snc:
+        print(f"  SNC guard: accepted={accepted} rejected={rejected}", flush=True)
     return model
 
 
@@ -95,6 +103,10 @@ def main():
     ap.add_argument("--seqlen", type=int, default=2048)
     ap.add_argument("--calib-dataset", default="c4", choices=["c4", "wikitext2"])
     ap.add_argument("--p", type=float, default=0.05, help="SNC budget fraction")
+    ap.add_argument("--lam", type=float, default=1.0, help="SNC SNR lambda")
+    ap.add_argument("--beta", type=float, default=1.0, help="SNC SNR beta")
+    ap.add_argument("--no-snc-guard", action="store_true",
+                    help="apply SNC even when calibration reconstruction MSE increases")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -108,7 +120,8 @@ def main():
           f"calib={len(calib)} p={args.p}")
     quantize_model(model, calib, args.bits, args.group_size,
                    use_snc=(args.method == "snc"), p=args.p, device=device,
-                   seed=args.seed)
+                   seed=args.seed, lam=args.lam, beta=args.beta,
+                   snc_guard=not args.no_snc_guard)
     model.save_pretrained(args.output_dir); tok.save_pretrained(args.output_dir)
     print(f"saved -> {args.output_dir}")
 

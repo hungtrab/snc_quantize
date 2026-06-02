@@ -19,6 +19,9 @@ def main():
     ap.add_argument("--seqlen", type=int, default=2048)
     ap.add_argument("--calib-dataset", default="c4", choices=["c4", "wikitext2"])
     ap.add_argument("--p", type=float, default=0.05)
+    ap.add_argument("--lam", type=float, default=1.0)
+    ap.add_argument("--beta", type=float, default=1.0)
+    ap.add_argument("--no-snc-guard", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--datasets", nargs="+", default=["wikitext2", "c4"])
     ap.add_argument("--tasks", default="")
@@ -45,7 +48,8 @@ def main():
         print(f"[{args.method}] bits={args.bits} gs={args.group_size} calib={len(calib)} p={args.p}")
         quantize_model(model, calib, args.bits, args.group_size,
                        use_snc=(args.method == "snc"), p=args.p, device="cuda",
-                       seed=args.seed)
+                       seed=args.seed, lam=args.lam, beta=args.beta,
+                       snc_guard=not args.no_snc_guard)
         model.cuda()
 
     for d in args.datasets:

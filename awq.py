@@ -13,6 +13,18 @@ import snc_core as C
 
 
 @torch.no_grad()
+def _reconstruction_mse(X, W_error, token_chunk=128):
+    """Mean output reconstruction error without materializing all token outputs."""
+    total = X.new_zeros(())
+    n = 0
+    for i in range(0, X.shape[0], token_chunk):
+        out_error = X[i:i + token_chunk] @ W_error.t()
+        total += out_error.pow(2).sum()
+        n += out_error.numel()
+    return (total / n).item()
+
+
+@torch.no_grad()
 def _q_group(Wg, bits):
     """Group-wise asym quant-dequant; Wg: (..., group_size)."""
     mx = Wg.amax(-1, keepdim=True); mn = Wg.amin(-1, keepdim=True)
@@ -77,7 +89,8 @@ def _clip_search(Ws, X_scaled, bits, group_size, n_grid=20, max_shrink=0.5,
 
 @torch.no_grad()
 def awq_quantize_linear(W, X, bits=4, group_size=128, n_grid=20,
-                        use_snc=True, p=0.05, lam=1.0, beta=1.0, clip=True):
+                        use_snc=True, p=0.05, lam=1.0, beta=1.0, clip=True,
+                        snc_guard=True):
     """W: (out, in) fp. X: (N, in) calibration input. Returns fake-quant W, info."""
     dev = W.device
     W = W.float(); X = X.float().to(dev)
@@ -85,6 +98,7 @@ def awq_quantize_linear(W, X, bits=4, group_size=128, n_grid=20,
 
     scales, alpha = _scale_search(W, X, bits, group_size, n_grid)
     Ws = W * scales
+    W_ref_s = Ws
     if clip:
         Ws = _clip_search(Ws, X / scales, bits, group_size, n_grid)
 
@@ -99,9 +113,21 @@ def awq_quantize_linear(W, X, bits=4, group_size=128, n_grid=20,
         asig, anoi = C.alpha_standalone(out_f, dev, torch.float32)
         spec = C.MatrixSpec(Ws, bits, group_size, mu_s, Sigma_s, sd_s, r_s, asig, anoi)
         res = C.snc_correct_block([spec], p=p, lam=lam, beta=beta)[0]
-        Wq = res["W_corrected"] / scales
-        info = {"alpha": alpha, "n_flips": res["n_flips"], "G": res["G"]}
+        W_base_s = C.dequant(*C.rtn_quantize(Ws, bits, group_size))
+        W_snc_s = res["W_corrected"]
+        accepted = True
+        base_mse = snc_mse = None
+        if snc_guard:
+            X_scaled = X / scales
+            base_mse = _reconstruction_mse(X_scaled, W_base_s - W_ref_s)
+            snc_mse = _reconstruction_mse(X_scaled, W_snc_s - W_ref_s)
+            accepted = snc_mse <= base_mse
+        Wq = (W_snc_s if accepted else W_base_s) / scales
+        info = {"alpha": alpha, "n_flips": res["n_flips"] if accepted else 0,
+                "G": res["G"] if accepted else 0.0, "snc_accepted": accepted,
+                "base_mse": base_mse, "snc_mse": snc_mse}
     else:
         Wq = C.dequant(*C.rtn_quantize(Ws, bits, group_size)) / scales
-        info = {"alpha": alpha, "n_flips": 0, "G": 0.0}
+        info = {"alpha": alpha, "n_flips": 0, "G": 0.0, "snc_accepted": None,
+                "base_mse": None, "snc_mse": None}
     return Wq, info
