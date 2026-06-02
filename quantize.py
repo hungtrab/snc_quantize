@@ -27,7 +27,13 @@ class _Catcher(nn.Module):
 
 
 @torch.no_grad()
-def quantize_model(model, calib, bits, group_size, use_snc, p, device):
+def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42):
+    # AWQ token subsampling uses torch.randperm in this function and in awq.py.
+    # Reset once per quantization run so independently launched AWQ/SNC runs
+    # see the same calibration subsets.
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     layers = model.model.layers
     model.model.embed_tokens.to(device)
     if hasattr(model.model, "rotary_emb") and model.model.rotary_emb is not None:
@@ -101,7 +107,8 @@ def main():
     print(f"[{args.method}] bits={args.bits} gs={args.group_size} "
           f"calib={len(calib)} p={args.p}")
     quantize_model(model, calib, args.bits, args.group_size,
-                   use_snc=(args.method == "snc"), p=args.p, device=device)
+                   use_snc=(args.method == "snc"), p=args.p, device=device,
+                   seed=args.seed)
     model.save_pretrained(args.output_dir); tok.save_pretrained(args.output_dir)
     print(f"saved -> {args.output_dir}")
 

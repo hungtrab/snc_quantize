@@ -44,7 +44,8 @@ def main():
         calib = get_calib(tok, args.n_calib, args.seqlen, args.seed, args.calib_dataset)
         print(f"[{args.method}] bits={args.bits} gs={args.group_size} calib={len(calib)} p={args.p}")
         quantize_model(model, calib, args.bits, args.group_size,
-                       use_snc=(args.method == "snc"), p=args.p, device="cuda")
+                       use_snc=(args.method == "snc"), p=args.p, device="cuda",
+                       seed=args.seed)
         model.cuda()
 
     for d in args.datasets:
