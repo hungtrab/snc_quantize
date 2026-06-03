@@ -16,6 +16,11 @@ def _linears(module):
     return {n: m for n, m in module.named_modules() if isinstance(m, nn.Linear)}
 
 
+def _is_tied_lm_head(model):
+    return (hasattr(model, "lm_head") and hasattr(model.model, "embed_tokens")
+            and model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr())
+
+
 class _Catcher(nn.Module):
     def __init__(self, layer): super().__init__(); self.layer = layer; self.inps = []; self.kwargs = None
     def forward(self, x, **kw):
@@ -28,7 +33,7 @@ class _Catcher(nn.Module):
 
 @torch.no_grad()
 def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42,
-                   lam=1.0, beta=1.0, snc_guard=True):
+                   lam=1.0, beta=1.0, snc_guard=True, include_lm_head=False):
     # AWQ token subsampling uses torch.randperm in this function and in awq.py.
     # Reset once per quantization run so independently launched AWQ/SNC runs
     # see the same calibration subsets.
@@ -89,6 +94,32 @@ def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42,
     model.cpu(); torch.cuda.empty_cache(); gc.collect()   # uniform device for save/eval
     if use_snc:
         print(f"  SNC guard: accepted={accepted} rejected={rejected}", flush=True)
+    if include_lm_head and hasattr(model, "lm_head"):
+        if _is_tied_lm_head(model):
+            print("  lm_head skipped: tied to embed_tokens", flush=True)
+        else:
+            if hasattr(model.model, "norm") and model.model.norm is not None:
+                model.model.norm.to(device)
+                head_inps = [model.model.norm(x.to(device)).reshape(-1, x.shape[-1]).cpu()
+                             for x in inps]
+                model.model.norm.cpu()
+            else:
+                head_inps = [x.reshape(-1, x.shape[-1]).cpu() for x in inps]
+            X = torch.cat(head_inps, 0)
+            if X.shape[0] > MAX_STAT_TOKENS:
+                X = X[torch.randperm(X.shape[0])[:MAX_STAT_TOKENS]]
+            model.lm_head.to(device)
+            Wq, info = awq_quantize_linear(model.lm_head.weight.data, X.to(device),
+                                           bits, group_size, use_snc=use_snc, p=p,
+                                           lam=lam, beta=beta, snc_guard=snc_guard)
+            model.lm_head.weight.data = Wq.to(model.lm_head.weight.dtype)
+            model.lm_head.cpu(); del X, head_inps
+            torch.cuda.empty_cache(); gc.collect()
+            if use_snc:
+                print(f"  lm_head SNC accepted={info['snc_accepted']} flips={info['n_flips']}",
+                      flush=True)
+            else:
+                print("  lm_head quantized", flush=True)
     return model
 
 
@@ -107,6 +138,8 @@ def main():
     ap.add_argument("--beta", type=float, default=1.0, help="SNC SNR beta")
     ap.add_argument("--no-snc-guard", action="store_true",
                     help="apply SNC even when calibration reconstruction MSE increases")
+    ap.add_argument("--include-lm-head", action="store_true",
+                    help="also quantize lm_head when it is not tied to embeddings")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -121,7 +154,8 @@ def main():
     quantize_model(model, calib, args.bits, args.group_size,
                    use_snc=(args.method == "snc"), p=args.p, device=device,
                    seed=args.seed, lam=args.lam, beta=args.beta,
-                   snc_guard=not args.no_snc_guard)
+                   snc_guard=not args.no_snc_guard,
+                   include_lm_head=args.include_lm_head)
     model.save_pretrained(args.output_dir); tok.save_pretrained(args.output_dir)
     print(f"saved -> {args.output_dir}")
 
