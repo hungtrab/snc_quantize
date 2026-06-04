@@ -97,6 +97,105 @@ def _qk_bilinear_alphas(model, lins, preps, device):
     }
 
 
+@torch.no_grad()
+def _qk_logits_mse(X, Wq, Wk, Wq_ref, Wk_ref, head_dim, device,
+                   max_tokens=256):
+    """Approximate attention-logit reconstruction loss for a Q/K pair.
+
+    This intentionally guards the bilinear dot-product that QK-SNC is trying to
+    protect, instead of guarding q_proj/k_proj as independent linears.
+    """
+    if X.shape[0] > max_tokens:
+        X = X[torch.randperm(X.shape[0])[:max_tokens]]
+    X = X.float().to(device)
+    Wq = Wq.float().to(device)
+    Wk = Wk.float().to(device)
+    Wq_ref = Wq_ref.float().to(device)
+    Wk_ref = Wk_ref.float().to(device)
+
+    q = X @ Wq.t()
+    k = X @ Wk.t()
+    q_ref = X @ Wq_ref.t()
+    k_ref = X @ Wk_ref.t()
+    n_q_heads = q.shape[1] // head_dim
+    n_k_heads = k.shape[1] // head_dim
+    if n_k_heads == 0 or n_q_heads % n_k_heads != 0:
+        return float("inf")
+    gqa_ratio = n_q_heads // n_k_heads
+    q = q.view(X.shape[0], n_q_heads, head_dim)
+    k = k.view(X.shape[0], n_k_heads, head_dim)
+    q_ref = q_ref.view(X.shape[0], n_q_heads, head_dim)
+    k_ref = k_ref.view(X.shape[0], n_k_heads, head_dim)
+
+    total = q.new_zeros(())
+    n = 0
+    scale = head_dim ** -0.5
+    for h in range(n_q_heads):
+        g = h // gqa_ratio
+        logits = (q[:, h] @ k[:, g].t()) * scale
+        ref = (q_ref[:, h] @ k_ref[:, g].t()) * scale
+        total += (logits - ref).pow(2).mean()
+        n += 1
+    return (total / max(n, 1)).item()
+
+
+@torch.no_grad()
+def _select_qk_pair(model, lins, preps, X_by_name, qk_alphas, bits, group_size,
+                    p, lam, beta, device):
+    q_name, k_name = _qk_proj_names(lins)
+    if q_name not in preps or k_name not in preps:
+        return {}, {}
+    if q_name not in qk_alphas or k_name not in qk_alphas:
+        return {}, {}
+
+    q_p = preps[q_name]
+    k_p = preps[k_name]
+    q_base, _ = awq_apply_prepared(q_p, use_snc=False)
+    k_base, _ = awq_apply_prepared(k_p, use_snc=False)
+    q_snc, q_info = awq_apply_prepared(
+        q_p, use_snc=True, p=p, lam=lam, beta=beta, snc_guard=False,
+        alpha_sig=qk_alphas[q_name][0], alpha_noi=qk_alphas[q_name][1])
+    k_snc, k_info = awq_apply_prepared(
+        k_p, use_snc=True, p=p, lam=lam, beta=beta, snc_guard=False,
+        alpha_sig=qk_alphas[k_name][0], alpha_noi=qk_alphas[k_name][1])
+
+    Wq_ref = lins[q_name].weight.data
+    Wk_ref = lins[k_name].weight.data
+    head_dim = _infer_head_dim(model)
+    X = X_by_name[q_name]
+    candidates = [
+        ("base/base", q_base, k_base, False, False),
+        ("snc/base", q_snc, k_base, True, False),
+        ("base/snc", q_base, k_snc, False, True),
+        ("snc/snc", q_snc, k_snc, True, True),
+    ]
+    scored = []
+    for label, Wq, Wk, use_q, use_k in candidates:
+        loss = _qk_logits_mse(X, Wq, Wk, Wq_ref, Wk_ref, head_dim, device)
+        scored.append((loss, label, Wq, Wk, use_q, use_k))
+    loss, label, Wq, Wk, use_q, use_k = min(scored, key=lambda x: x[0])
+    score_msg = " ".join(f"{label_i}={loss_i:.4e}" for loss_i, label_i, *_ in scored)
+    print(f"    QK guard: choose={label} {score_msg}", flush=True)
+
+    def _info(src, accepted):
+        out = dict(src)
+        out["snc_accepted"] = accepted
+        if not accepted:
+            out["n_flips"] = 0
+            out["G"] = 0.0
+        out["qk_guard"] = label
+        out["qk_guard_loss"] = loss
+        return out
+
+    return {
+        q_name: Wq,
+        k_name: Wk,
+    }, {
+        q_name: _info(q_info, use_q),
+        k_name: _info(k_info, use_k),
+    }
+
+
 class _Catcher(nn.Module):
     def __init__(self, layer): super().__init__(); self.layer = layer; self.inps = []; self.kwargs = None
     def forward(self, x, **kw):
@@ -163,13 +262,20 @@ def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42,
                 preps[n] = awq_prepare_linear(m.weight.data, X_by_name[n].to(device),
                                               bits, group_size)
         qk_alphas = _qk_bilinear_alphas(model, lins, preps, device) if (use_snc and qk_snc) else {}
+        qk_weights, qk_infos = ({}, {})
+        if use_snc and qk_snc:
+            qk_weights, qk_infos = _select_qk_pair(
+                model, lins, preps, X_by_name, qk_alphas, bits, group_size,
+                p, lam, beta, device)
 
         for n, m in lins.items():
             X = X_by_name[n]
             alpha_sig = alpha_noi = None
             if n in qk_alphas:
                 alpha_sig, alpha_noi = qk_alphas[n]
-            if n in preps:
+            if n in qk_weights:
+                Wq, info = qk_weights[n], qk_infos[n]
+            elif n in preps:
                 Wq, info = awq_apply_prepared(preps[n], use_snc=use_snc, p=p,
                                               lam=lam, beta=beta,
                                               snc_guard=snc_guard,
