@@ -6,7 +6,7 @@ Works for Llama / Llama-3.x / Mistral / Qwen2.5 (model.model.layers).
 """
 import argparse, gc, torch, torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from awq import awq_quantize_linear
+from awq import awq_apply_prepared, awq_prepare_linear, awq_quantize_linear
 from data import get_calib
 import snc_core as C
 
@@ -43,17 +43,21 @@ def _qk_proj_names(lins):
 
 
 @torch.no_grad()
-def _qk_bilinear_alphas(model, lins, X_by_name, device):
+def _qk_bilinear_alphas(model, lins, preps, device):
     q_name, k_name = _qk_proj_names(lins)
     if q_name is None or k_name is None:
         return {}
-    if q_name not in X_by_name:
+    if q_name not in preps or k_name not in preps:
         return {}
 
+    q_p = preps[q_name]
+    k_p = preps[k_name]
+    q_scales = q_p["scales"].to(device)
+    k_scales = k_p["scales"].to(device)
     Wq = lins[q_name].weight.data.float().to(device)
     Wk = lins[k_name].weight.data.float().to(device)
-    X = X_by_name[q_name].float().to(device)
-    mu, Sigma, _, _ = C.block_stats(X)
+    Wq_for_k = Wq * k_scales[None, :]
+    Wk_for_q = Wk * q_scales[None, :]
 
     q_out, hidden = Wq.shape
     k_out = Wk.shape[0]
@@ -66,19 +70,21 @@ def _qk_bilinear_alphas(model, lins, X_by_name, device):
         return {}
     gqa_ratio = n_q_heads // n_k_heads
 
-    Wq_h = Wq.view(n_q_heads, head_dim, hidden)
-    Wk_h = Wk.view(n_k_heads, head_dim, hidden)
+    Wq_h = Wq_for_k.view(n_q_heads, head_dim, hidden)
+    Wk_h = Wk_for_q.view(n_k_heads, head_dim, hidden)
 
-    # Q flips are scored by the K head read by that Q head.
-    v_k = torch.einsum("ghd,d->gh", Wk_h, mu)
+    # Q flips live in the AWQ-scaled Q coordinate, so K is represented in that
+    # coordinate too: X Wk^T == (X / s_q) (Wk * s_q)^T.
+    v_k = torch.einsum("ghd,d->gh", Wk_h, q_p["mu_s"])
     alpha_sig_q = v_k.pow(2).repeat_interleave(gqa_ratio, dim=0)
-    sig_wk_t = torch.einsum("ij,gdj->gdi", Sigma, Wk_h)
+    sig_wk_t = torch.einsum("ij,gdj->gdi", q_p["Sigma_s"], Wk_h)
     alpha_noi_q = (Wk_h * sig_wk_t).sum(dim=2).clamp(min=0.0).repeat_interleave(gqa_ratio, dim=0)
 
-    # K flips aggregate importance from all Q heads sharing the K head.
-    v_q = torch.einsum("hjd,d->hj", Wq_h, mu)
+    # K flips live in the AWQ-scaled K coordinate and aggregate all Q heads
+    # sharing that K head under GQA.
+    v_q = torch.einsum("hjd,d->hj", Wq_h, k_p["mu_s"])
     alpha_sig_per_q = v_q.pow(2)
-    sig_wq_t = torch.einsum("ij,hdj->hdi", Sigma, Wq_h)
+    sig_wq_t = torch.einsum("ij,hdj->hdi", k_p["Sigma_s"], Wq_h)
     alpha_noi_per_q = (Wq_h * sig_wq_t).sum(dim=2).clamp(min=0.0)
     alpha_sig_k = alpha_sig_per_q.view(n_k_heads, gqa_ratio, head_dim).sum(dim=1)
     alpha_noi_k = alpha_noi_per_q.view(n_k_heads, gqa_ratio, head_dim).sum(dim=1)
@@ -151,23 +157,34 @@ def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42,
             q_name, k_name = _qk_proj_names(lins)
             if q_name in X_by_name and k_name in X_by_name:
                 X_by_name[k_name] = X_by_name[q_name]
-        qk_alphas = _qk_bilinear_alphas(model, lins, X_by_name, device) if (use_snc and qk_snc) else {}
+        preps = {}
+        if use_snc and qk_snc:
+            for n, m in lins.items():
+                preps[n] = awq_prepare_linear(m.weight.data, X_by_name[n].to(device),
+                                              bits, group_size)
+        qk_alphas = _qk_bilinear_alphas(model, lins, preps, device) if (use_snc and qk_snc) else {}
 
         for n, m in lins.items():
             X = X_by_name[n]
             alpha_sig = alpha_noi = None
             if n in qk_alphas:
                 alpha_sig, alpha_noi = qk_alphas[n]
-            Wq, info = awq_quantize_linear(m.weight.data, X.to(device), bits, group_size,
-                                           use_snc=use_snc, p=p, lam=lam, beta=beta,
-                                           snc_guard=snc_guard,
-                                           alpha_sig=alpha_sig, alpha_noi=alpha_noi)
+            if n in preps:
+                Wq, info = awq_apply_prepared(preps[n], use_snc=use_snc, p=p,
+                                              lam=lam, beta=beta,
+                                              snc_guard=snc_guard,
+                                              alpha_sig=alpha_sig, alpha_noi=alpha_noi)
+            else:
+                Wq, info = awq_quantize_linear(m.weight.data, X.to(device), bits, group_size,
+                                               use_snc=use_snc, p=p, lam=lam, beta=beta,
+                                               snc_guard=snc_guard,
+                                               alpha_sig=alpha_sig, alpha_noi=alpha_noi)
             if info["snc_accepted"] is not None:
                 accepted += int(info["snc_accepted"])
                 rejected += int(not info["snc_accepted"])
             m.weight.data = Wq.to(m.weight.dtype)
             caught[n].clear(); del X
-        caught.clear(); X_by_name.clear()
+        caught.clear(); X_by_name.clear(); preps.clear()
 
         def _fwd(x):
             o = layer(x.to(device), **kwargs)

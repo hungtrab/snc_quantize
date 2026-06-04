@@ -88,10 +88,8 @@ def _clip_search(Ws, X_scaled, bits, group_size, n_grid=20, max_shrink=0.5,
 
 
 @torch.no_grad()
-def awq_quantize_linear(W, X, bits=4, group_size=128, n_grid=20,
-                        use_snc=True, p=0.05, lam=1.0, beta=1.0, clip=True,
-                        snc_guard=True, alpha_sig=None, alpha_noi=None):
-    """W: (out, in) fp. X: (N, in) calibration input. Returns fake-quant W, info."""
+def awq_prepare_linear(W, X, bits=4, group_size=128, n_grid=20, clip=True):
+    """Run AWQ scale/clip search and precompute the scaled SNC statistics."""
     dev = W.device
     W = W.float(); X = X.float().to(dev)
     mu, Sigma, _, _ = C.block_stats(X)
@@ -102,20 +100,48 @@ def awq_quantize_linear(W, X, bits=4, group_size=128, n_grid=20,
     if clip:
         Ws = _clip_search(Ws, X / scales, bits, group_size, n_grid)
 
+    inv = 1.0 / scales
+    Sigma_s = Sigma * inv[None, :] * inv[:, None]
+    A = Sigma_s.abs()
+    return {
+        "W": W,
+        "X": X,
+        "bits": bits,
+        "group_size": group_size,
+        "scales": scales,
+        "alpha": alpha,
+        "Ws": Ws,
+        "W_ref_s": W_ref_s,
+        "mu": mu,
+        "Sigma": Sigma,
+        "mu_s": mu / scales,
+        "Sigma_s": Sigma_s,
+        "sd_s": torch.diagonal(Sigma_s).clamp(min=0.0),
+        "r_s": A.sum(1) - torch.diagonal(A),
+    }
+
+
+@torch.no_grad()
+def awq_apply_prepared(prep, use_snc=True, p=0.05, lam=1.0, beta=1.0,
+                       snc_guard=True, alpha_sig=None, alpha_noi=None):
+    """Quantize a prepared AWQ linear, optionally applying SNC in scaled space."""
+    W = prep["W"]
+    X = prep["X"]
+    bits = prep["bits"]
+    group_size = prep["group_size"]
+    scales = prep["scales"]
+    Ws = prep["Ws"]
+    W_ref_s = prep["W_ref_s"]
+    dev = W.device
     out_f = W.shape[0]
     if use_snc:
-        mu_s = mu / scales
-        inv = 1.0 / scales
-        Sigma_s = Sigma * inv[None, :] * inv[:, None]
-        A = Sigma_s.abs()
-        sd_s = torch.diagonal(Sigma_s).clamp(min=0.0)
-        r_s = A.sum(1) - torch.diagonal(A)
         if alpha_sig is None or alpha_noi is None:
             asig, anoi = C.alpha_standalone(out_f, dev, torch.float32)
         else:
             asig = alpha_sig.to(device=dev, dtype=torch.float32)
             anoi = alpha_noi.to(device=dev, dtype=torch.float32)
-        spec = C.MatrixSpec(Ws, bits, group_size, mu_s, Sigma_s, sd_s, r_s, asig, anoi)
+        spec = C.MatrixSpec(Ws, bits, group_size, prep["mu_s"], prep["Sigma_s"],
+                            prep["sd_s"], prep["r_s"], asig, anoi)
         res = C.snc_correct_block([spec], p=p, lam=lam, beta=beta)[0]
         W_base_s = C.dequant(*C.rtn_quantize(Ws, bits, group_size))
         W_snc_s = res["W_corrected"]
@@ -127,11 +153,22 @@ def awq_quantize_linear(W, X, bits=4, group_size=128, n_grid=20,
             snc_mse = _reconstruction_mse(X_scaled, W_snc_s - W_ref_s)
             accepted = snc_mse <= base_mse
         Wq = (W_snc_s if accepted else W_base_s) / scales
-        info = {"alpha": alpha, "n_flips": res["n_flips"] if accepted else 0,
+        info = {"alpha": prep["alpha"], "n_flips": res["n_flips"] if accepted else 0,
                 "G": res["G"] if accepted else 0.0, "snc_accepted": accepted,
                 "base_mse": base_mse, "snc_mse": snc_mse}
     else:
         Wq = C.dequant(*C.rtn_quantize(Ws, bits, group_size)) / scales
-        info = {"alpha": alpha, "n_flips": 0, "G": 0.0, "snc_accepted": None,
+        info = {"alpha": prep["alpha"], "n_flips": 0, "G": 0.0, "snc_accepted": None,
                 "base_mse": None, "snc_mse": None}
     return Wq, info
+
+
+@torch.no_grad()
+def awq_quantize_linear(W, X, bits=4, group_size=128, n_grid=20,
+                        use_snc=True, p=0.05, lam=1.0, beta=1.0, clip=True,
+                        snc_guard=True, alpha_sig=None, alpha_noi=None):
+    """W: (out, in) fp. X: (N, in) calibration input. Returns fake-quant W, info."""
+    prep = awq_prepare_linear(W, X, bits, group_size, n_grid, clip)
+    return awq_apply_prepared(prep, use_snc=use_snc, p=p, lam=lam, beta=beta,
+                              snc_guard=snc_guard,
+                              alpha_sig=alpha_sig, alpha_noi=alpha_noi)
