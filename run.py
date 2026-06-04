@@ -23,6 +23,8 @@ def main():
     ap.add_argument("--beta", type=float, default=1.0)
     ap.add_argument("--no-snc-guard", action="store_true")
     ap.add_argument("--include-lm-head", action="store_true")
+    ap.add_argument("--qk-snc", action="store_true",
+                    help="use bilinear GQA alpha for q_proj/k_proj SNC")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--datasets", nargs="+", default=["wikitext2", "c4"])
     ap.add_argument("--tasks", default="")
@@ -51,7 +53,8 @@ def main():
                        use_snc=(args.method == "snc"), p=args.p, device="cuda",
                        seed=args.seed, lam=args.lam, beta=args.beta,
                        snc_guard=not args.no_snc_guard,
-                       include_lm_head=args.include_lm_head)
+                       include_lm_head=args.include_lm_head,
+                       qk_snc=args.qk_snc)
         model.cuda()
 
     for d in args.datasets:

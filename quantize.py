@@ -8,6 +8,7 @@ import argparse, gc, torch, torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from awq import awq_quantize_linear
 from data import get_calib
+import snc_core as C
 
 MAX_STAT_TOKENS = 4096   # subsample per linear for stats/grid (memory bound)
 
@@ -19,6 +20,75 @@ def _linears(module):
 def _is_tied_lm_head(model):
     return (hasattr(model, "lm_head") and hasattr(model.model, "embed_tokens")
             and model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr())
+
+
+def _infer_head_dim(model):
+    cfg = getattr(model, "config", None)
+    if cfg is not None and getattr(cfg, "head_dim", None) is not None:
+        return cfg.head_dim
+    if cfg is not None and getattr(cfg, "hidden_size", None) and getattr(cfg, "num_attention_heads", None):
+        return cfg.hidden_size // cfg.num_attention_heads
+    return 128
+
+
+def _qk_proj_names(lins):
+    q_name = k_name = None
+    for name in lins:
+        low = name.lower()
+        if "q_proj" in low or "query" in low:
+            q_name = name
+        elif "k_proj" in low or "key" in low:
+            k_name = name
+    return q_name, k_name
+
+
+@torch.no_grad()
+def _qk_bilinear_alphas(model, lins, X_by_name, device):
+    q_name, k_name = _qk_proj_names(lins)
+    if q_name is None or k_name is None:
+        return {}
+    if q_name not in X_by_name:
+        return {}
+
+    Wq = lins[q_name].weight.data.float().to(device)
+    Wk = lins[k_name].weight.data.float().to(device)
+    X = X_by_name[q_name].float().to(device)
+    mu, Sigma, _, _ = C.block_stats(X)
+
+    q_out, hidden = Wq.shape
+    k_out = Wk.shape[0]
+    head_dim = _infer_head_dim(model)
+    if q_out % head_dim != 0 or k_out % head_dim != 0:
+        return {}
+    n_q_heads = q_out // head_dim
+    n_k_heads = k_out // head_dim
+    if n_k_heads == 0 or n_q_heads % n_k_heads != 0:
+        return {}
+    gqa_ratio = n_q_heads // n_k_heads
+
+    Wq_h = Wq.view(n_q_heads, head_dim, hidden)
+    Wk_h = Wk.view(n_k_heads, head_dim, hidden)
+
+    # Q flips are scored by the K head read by that Q head.
+    v_k = torch.einsum("ghd,d->gh", Wk_h, mu)
+    alpha_sig_q = v_k.pow(2).repeat_interleave(gqa_ratio, dim=0)
+    sig_wk_t = torch.einsum("ij,gdj->gdi", Sigma, Wk_h)
+    alpha_noi_q = (Wk_h * sig_wk_t).sum(dim=2).clamp(min=0.0).repeat_interleave(gqa_ratio, dim=0)
+
+    # K flips aggregate importance from all Q heads sharing the K head.
+    v_q = torch.einsum("hjd,d->hj", Wq_h, mu)
+    alpha_sig_per_q = v_q.pow(2)
+    sig_wq_t = torch.einsum("ij,hdj->hdi", Sigma, Wq_h)
+    alpha_noi_per_q = (Wq_h * sig_wq_t).sum(dim=2).clamp(min=0.0)
+    alpha_sig_k = alpha_sig_per_q.view(n_k_heads, gqa_ratio, head_dim).sum(dim=1)
+    alpha_noi_k = alpha_noi_per_q.view(n_k_heads, gqa_ratio, head_dim).sum(dim=1)
+
+    print(f"    QK-SNC: q_heads={n_q_heads} k_heads={n_k_heads} ratio={gqa_ratio} head_dim={head_dim}",
+          flush=True)
+    return {
+        q_name: (alpha_sig_q.reshape(q_out).cpu(), alpha_noi_q.reshape(q_out).cpu()),
+        k_name: (alpha_sig_k.reshape(k_out).cpu(), alpha_noi_k.reshape(k_out).cpu()),
+    }
 
 
 class _Catcher(nn.Module):
@@ -33,7 +103,8 @@ class _Catcher(nn.Module):
 
 @torch.no_grad()
 def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42,
-                   lam=1.0, beta=1.0, snc_guard=True, include_lm_head=False):
+                   lam=1.0, beta=1.0, snc_guard=True, include_lm_head=False,
+                   qk_snc=False):
     # AWQ token subsampling uses torch.randperm in this function and in awq.py.
     # Reset once per quantization run so independently launched AWQ/SNC runs
     # see the same calibration subsets.
@@ -69,19 +140,34 @@ def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42,
             layer(x.to(device), **kwargs)
         for h in hooks: h.remove()
 
-        for n, m in lins.items():
+        X_by_name = {}
+        for n in lins:
             X = torch.cat(caught[n], 0)
             if X.shape[0] > MAX_STAT_TOKENS:
                 X = X[torch.randperm(X.shape[0])[:MAX_STAT_TOKENS]]
+            X_by_name[n] = X
+
+        if use_snc and qk_snc:
+            q_name, k_name = _qk_proj_names(lins)
+            if q_name in X_by_name and k_name in X_by_name:
+                X_by_name[k_name] = X_by_name[q_name]
+        qk_alphas = _qk_bilinear_alphas(model, lins, X_by_name, device) if (use_snc and qk_snc) else {}
+
+        for n, m in lins.items():
+            X = X_by_name[n]
+            alpha_sig = alpha_noi = None
+            if n in qk_alphas:
+                alpha_sig, alpha_noi = qk_alphas[n]
             Wq, info = awq_quantize_linear(m.weight.data, X.to(device), bits, group_size,
                                            use_snc=use_snc, p=p, lam=lam, beta=beta,
-                                           snc_guard=snc_guard)
+                                           snc_guard=snc_guard,
+                                           alpha_sig=alpha_sig, alpha_noi=alpha_noi)
             if info["snc_accepted"] is not None:
                 accepted += int(info["snc_accepted"])
                 rejected += int(not info["snc_accepted"])
             m.weight.data = Wq.to(m.weight.dtype)
             caught[n].clear(); del X
-        caught.clear()
+        caught.clear(); X_by_name.clear()
 
         def _fwd(x):
             o = layer(x.to(device), **kwargs)
@@ -140,6 +226,8 @@ def main():
                     help="apply SNC even when calibration reconstruction MSE increases")
     ap.add_argument("--include-lm-head", action="store_true",
                     help="also quantize lm_head when it is not tied to embeddings")
+    ap.add_argument("--qk-snc", action="store_true",
+                    help="use bilinear GQA alpha for q_proj/k_proj SNC")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -155,7 +243,8 @@ def main():
                    use_snc=(args.method == "snc"), p=args.p, device=device,
                    seed=args.seed, lam=args.lam, beta=args.beta,
                    snc_guard=not args.no_snc_guard,
-                   include_lm_head=args.include_lm_head)
+                   include_lm_head=args.include_lm_head,
+                   qk_snc=args.qk_snc)
     model.save_pretrained(args.output_dir); tok.save_pretrained(args.output_dir)
     print(f"saved -> {args.output_dir}")
 

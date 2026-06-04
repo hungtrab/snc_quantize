@@ -90,7 +90,7 @@ def _clip_search(Ws, X_scaled, bits, group_size, n_grid=20, max_shrink=0.5,
 @torch.no_grad()
 def awq_quantize_linear(W, X, bits=4, group_size=128, n_grid=20,
                         use_snc=True, p=0.05, lam=1.0, beta=1.0, clip=True,
-                        snc_guard=True):
+                        snc_guard=True, alpha_sig=None, alpha_noi=None):
     """W: (out, in) fp. X: (N, in) calibration input. Returns fake-quant W, info."""
     dev = W.device
     W = W.float(); X = X.float().to(dev)
@@ -110,7 +110,11 @@ def awq_quantize_linear(W, X, bits=4, group_size=128, n_grid=20,
         A = Sigma_s.abs()
         sd_s = torch.diagonal(Sigma_s).clamp(min=0.0)
         r_s = A.sum(1) - torch.diagonal(A)
-        asig, anoi = C.alpha_standalone(out_f, dev, torch.float32)
+        if alpha_sig is None or alpha_noi is None:
+            asig, anoi = C.alpha_standalone(out_f, dev, torch.float32)
+        else:
+            asig = alpha_sig.to(device=dev, dtype=torch.float32)
+            anoi = alpha_noi.to(device=dev, dtype=torch.float32)
         spec = C.MatrixSpec(Ws, bits, group_size, mu_s, Sigma_s, sd_s, r_s, asig, anoi)
         res = C.snc_correct_block([spec], p=p, lam=lam, beta=beta)[0]
         W_base_s = C.dequant(*C.rtn_quantize(Ws, bits, group_size))
