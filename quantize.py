@@ -4,7 +4,7 @@ Standard GPTQ/AWQ flow — a single calibration forward, memory-bounded (only on
 layer resident), error-propagation aware (layer i+1 sees quantized layer i).
 Works for Llama / Llama-3.x / Mistral / Qwen2.5 (model.model.layers).
 """
-import argparse, gc, torch, torch.nn as nn
+import argparse, gc, itertools, torch, torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from awq import awq_apply_prepared, awq_prepare_linear, awq_quantize_linear
 from data import get_calib
@@ -40,6 +40,21 @@ def _qk_proj_names(lins):
         elif "k_proj" in low or "key" in low:
             k_name = name
     return q_name, k_name
+
+
+def _attn_proj_names(lins):
+    out = {}
+    for name in lins:
+        low = name.lower()
+        if "q_proj" in low or "query" in low:
+            out["q"] = name
+        elif "k_proj" in low or "key" in low:
+            out["k"] = name
+        elif "v_proj" in low or "value" in low:
+            out["v"] = name
+        elif "o_proj" in low or "out_proj" in low:
+            out["o"] = name
+    return out
 
 
 @torch.no_grad()
@@ -196,6 +211,125 @@ def _select_qk_pair(model, lins, preps, X_by_name, qk_alphas, bits, group_size,
     }
 
 
+def _crop_mask(mask, T, device):
+    if mask is None:
+        return None
+    mask = mask.to(device)
+    if mask.dim() >= 4:
+        return mask[..., :T, :T]
+    if mask.dim() >= 2:
+        return mask[..., :T]
+    return mask
+
+
+def _crop_cache_position(cache_position, T, device):
+    if cache_position is None:
+        return None
+    return cache_position[:T].to(device)
+
+
+@torch.no_grad()
+def _attn_outputs(model, layer, lins, inps, kwargs, weights, device,
+                  max_samples=1, max_seq=256):
+    old = {}
+    for name, W in weights.items():
+        old[name] = lins[name].weight.data
+        lins[name].weight.data = W.to(device=device, dtype=lins[name].weight.dtype)
+
+    outs = []
+    try:
+        for x in inps[:max_samples]:
+            hs = x.to(device)
+            if hs.shape[1] > max_seq:
+                hs = hs[:, :max_seq, :]
+            T = hs.shape[1]
+            if hasattr(layer, "input_layernorm") and layer.input_layernorm is not None:
+                attn_in = layer.input_layernorm(hs)
+            else:
+                attn_in = hs
+            pos_ids = kwargs.get("position_ids")
+            if pos_ids is None:
+                pos_ids = torch.arange(T, device=device).unsqueeze(0)
+            else:
+                pos_ids = pos_ids[:, :T].to(device)
+            position_embeddings = model.model.rotary_emb(attn_in, pos_ids)
+            attn_mask = _crop_mask(kwargs.get("attention_mask"), T, device)
+            cache_position = _crop_cache_position(kwargs.get("cache_position"), T, device)
+            out = layer.self_attn(
+                attn_in,
+                position_embeddings=position_embeddings,
+                attention_mask=attn_mask,
+                past_key_values=None,
+                cache_position=cache_position,
+            )
+            out = out[0] if isinstance(out, tuple) else out
+            outs.append(out.float().detach())
+    finally:
+        for name, W in old.items():
+            lins[name].weight.data = W
+    return outs
+
+
+@torch.no_grad()
+def _attention_output_mse(model, layer, lins, inps, kwargs, weights, ref_outs, device):
+    outs = _attn_outputs(model, layer, lins, inps, kwargs, weights, device)
+    if not outs or len(outs) != len(ref_outs):
+        return float("inf")
+    total = outs[0].new_zeros(())
+    for out, ref in zip(outs, ref_outs):
+        total += (out - ref).pow(2).mean()
+    return (total / len(outs)).item()
+
+
+@torch.no_grad()
+def _select_attention_block(model, layer, lins, preps, inps, kwargs, qk_alphas,
+                            p, lam, beta, device):
+    names = _attn_proj_names(lins)
+    ordered = [names[k] for k in ("q", "k", "v", "o") if k in names and names[k] in preps]
+    if len(ordered) < 2:
+        return {}, {}
+
+    candidates = {}
+    infos = {}
+    ref_weights = {name: lins[name].weight.data.float().to(device) for name in ordered}
+    for name in ordered:
+        base, _ = awq_apply_prepared(preps[name], use_snc=False)
+        alpha_sig = alpha_noi = None
+        if name in qk_alphas:
+            alpha_sig, alpha_noi = qk_alphas[name]
+        snc, info = awq_apply_prepared(
+            preps[name], use_snc=True, p=p, lam=lam, beta=beta,
+            snc_guard=False, alpha_sig=alpha_sig, alpha_noi=alpha_noi)
+        candidates[name] = (base, snc)
+        infos[name] = info
+
+    ref_outs = _attn_outputs(model, layer, lins, inps, kwargs, ref_weights, device)
+    scored = []
+    for mask in itertools.product((0, 1), repeat=len(ordered)):
+        weights = {name: candidates[name][use_snc] for name, use_snc in zip(ordered, mask)}
+        loss = _attention_output_mse(model, layer, lins, inps, kwargs, weights, ref_outs, device)
+        label = "/".join(f"{name.split('.')[-1]}:{'snc' if use_snc else 'base'}"
+                         for name, use_snc in zip(ordered, mask))
+        scored.append((loss, label, weights, mask))
+
+    loss, label, weights, mask = min(scored, key=lambda x: x[0])
+    base_loss = scored[0][0]
+    print(f"    attn guard: choose={label} loss={loss:.4e} base={base_loss:.4e}",
+          flush=True)
+
+    out_infos = {}
+    for name, use_snc in zip(ordered, mask):
+        src = dict(infos[name])
+        src["snc_accepted"] = bool(use_snc)
+        if not use_snc:
+            src["n_flips"] = 0
+            src["G"] = 0.0
+        src["attn_guard"] = label
+        src["attn_guard_loss"] = loss
+        out_infos[name] = src
+    return weights, out_infos
+
+
 class _Catcher(nn.Module):
     def __init__(self, layer): super().__init__(); self.layer = layer; self.inps = []; self.kwargs = None
     def forward(self, x, **kw):
@@ -209,7 +343,7 @@ class _Catcher(nn.Module):
 @torch.no_grad()
 def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42,
                    lam=1.0, beta=1.0, snc_guard=True, include_lm_head=False,
-                   qk_snc=False):
+                   qk_snc=False, attn_guard=False):
     # AWQ token subsampling uses torch.randperm in this function and in awq.py.
     # Reset once per quantization run so independently launched AWQ/SNC runs
     # see the same calibration subsets.
@@ -263,7 +397,11 @@ def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42,
                                               bits, group_size)
         qk_alphas = _qk_bilinear_alphas(model, lins, preps, device) if (use_snc and qk_snc) else {}
         qk_weights, qk_infos = ({}, {})
-        if use_snc and qk_snc:
+        if use_snc and qk_snc and attn_guard:
+            qk_weights, qk_infos = _select_attention_block(
+                model, layer, lins, preps, inps, kwargs, qk_alphas,
+                p, lam, beta, device)
+        elif use_snc and qk_snc:
             qk_weights, qk_infos = _select_qk_pair(
                 model, lins, preps, X_by_name, qk_alphas, bits, group_size,
                 p, lam, beta, device)
@@ -351,6 +489,8 @@ def main():
                     help="also quantize lm_head when it is not tied to embeddings")
     ap.add_argument("--qk-snc", action="store_true",
                     help="use bilinear GQA alpha for q_proj/k_proj SNC")
+    ap.add_argument("--attn-guard", action="store_true",
+                    help="choose q/k/v/o candidates by true self-attention output loss")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -367,7 +507,8 @@ def main():
                    seed=args.seed, lam=args.lam, beta=args.beta,
                    snc_guard=not args.no_snc_guard,
                    include_lm_head=args.include_lm_head,
-                   qk_snc=args.qk_snc)
+                   qk_snc=args.qk_snc,
+                   attn_guard=args.attn_guard)
     model.save_pretrained(args.output_dir); tok.save_pretrained(args.output_dir)
     print(f"saved -> {args.output_dir}")
 
