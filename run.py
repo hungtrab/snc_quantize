@@ -27,6 +27,8 @@ def main():
                     help="use bilinear GQA alpha for q_proj/k_proj SNC")
     ap.add_argument("--attn-guard", action="store_true",
                     help="choose q/k/v/o candidates by true self-attention output loss")
+    ap.add_argument("--hybrid-guard", action="store_true",
+                    help="choose q/k by QK logits, then v/o by attention output loss")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--datasets", nargs="+", default=["wikitext2", "c4"])
     ap.add_argument("--tasks", default="")
@@ -57,7 +59,8 @@ def main():
                        snc_guard=not args.no_snc_guard,
                        include_lm_head=args.include_lm_head,
                        qk_snc=args.qk_snc,
-                       attn_guard=args.attn_guard)
+                       attn_guard=args.attn_guard,
+                       hybrid_guard=args.hybrid_guard)
         model.cuda()
 
     for d in args.datasets:

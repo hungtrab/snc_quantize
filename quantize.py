@@ -330,6 +330,68 @@ def _select_attention_block(model, layer, lins, preps, inps, kwargs, qk_alphas,
     return weights, out_infos
 
 
+@torch.no_grad()
+def _select_hybrid_attention_block(model, layer, lins, preps, X_by_name, inps,
+                                   kwargs, qk_alphas, bits, group_size, p, lam,
+                                   beta, device):
+    """Use QK-logit guard for q/k, then true attention-output guard for v/o.
+
+    The full attention guard is a good local metric but can move q/k away from
+    the bilinear objective that correlated with PPL. This hybrid keeps the
+    stronger q/k decision and only uses the full attention path for value/output
+    mixing.
+    """
+    qk_weights, qk_infos = _select_qk_pair(
+        model, lins, preps, X_by_name, qk_alphas, bits, group_size,
+        p, lam, beta, device)
+    names = _attn_proj_names(lins)
+    vo_names = [names[k] for k in ("v", "o") if k in names and names[k] in preps]
+    if not vo_names:
+        return qk_weights, qk_infos
+
+    weights_fixed = dict(qk_weights)
+    candidates = {}
+    infos = {}
+    for name in vo_names:
+        base, _ = awq_apply_prepared(preps[name], use_snc=False)
+        snc, info = awq_apply_prepared(
+            preps[name], use_snc=True, p=p, lam=lam, beta=beta,
+            snc_guard=False)
+        candidates[name] = (base, snc)
+        infos[name] = info
+
+    ref_names = set(weights_fixed) | set(vo_names)
+    ref_weights = {name: lins[name].weight.data.float().to(device) for name in ref_names}
+    ref_outs = _attn_outputs(model, layer, lins, inps, kwargs, ref_weights, device)
+
+    scored = []
+    for mask in itertools.product((0, 1), repeat=len(vo_names)):
+        weights = dict(weights_fixed)
+        for name, use_snc in zip(vo_names, mask):
+            weights[name] = candidates[name][use_snc]
+        loss = _attention_output_mse(model, layer, lins, inps, kwargs, weights, ref_outs, device)
+        label = "/".join(f"{name.split('.')[-1]}:{'snc' if use_snc else 'base'}"
+                         for name, use_snc in zip(vo_names, mask))
+        scored.append((loss, label, weights, mask))
+
+    loss, label, weights, mask = min(scored, key=lambda x: x[0])
+    base_loss = scored[0][0]
+    print(f"    hybrid attn guard: choose={label} loss={loss:.4e} base={base_loss:.4e}",
+          flush=True)
+
+    out_infos = dict(qk_infos)
+    for name, use_snc in zip(vo_names, mask):
+        src = dict(infos[name])
+        src["snc_accepted"] = bool(use_snc)
+        if not use_snc:
+            src["n_flips"] = 0
+            src["G"] = 0.0
+        src["hybrid_attn_guard"] = label
+        src["hybrid_attn_guard_loss"] = loss
+        out_infos[name] = src
+    return weights, out_infos
+
+
 class _Catcher(nn.Module):
     def __init__(self, layer): super().__init__(); self.layer = layer; self.inps = []; self.kwargs = None
     def forward(self, x, **kw):
@@ -343,7 +405,7 @@ class _Catcher(nn.Module):
 @torch.no_grad()
 def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42,
                    lam=1.0, beta=1.0, snc_guard=True, include_lm_head=False,
-                   qk_snc=False, attn_guard=False):
+                   qk_snc=False, attn_guard=False, hybrid_guard=False):
     # AWQ token subsampling uses torch.randperm in this function and in awq.py.
     # Reset once per quantization run so independently launched AWQ/SNC runs
     # see the same calibration subsets.
@@ -397,7 +459,11 @@ def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42,
                                               bits, group_size)
         qk_alphas = _qk_bilinear_alphas(model, lins, preps, device) if (use_snc and qk_snc) else {}
         qk_weights, qk_infos = ({}, {})
-        if use_snc and qk_snc and attn_guard:
+        if use_snc and qk_snc and hybrid_guard:
+            qk_weights, qk_infos = _select_hybrid_attention_block(
+                model, layer, lins, preps, X_by_name, inps, kwargs, qk_alphas,
+                bits, group_size, p, lam, beta, device)
+        elif use_snc and qk_snc and attn_guard:
             qk_weights, qk_infos = _select_attention_block(
                 model, layer, lins, preps, inps, kwargs, qk_alphas,
                 p, lam, beta, device)
@@ -491,6 +557,8 @@ def main():
                     help="use bilinear GQA alpha for q_proj/k_proj SNC")
     ap.add_argument("--attn-guard", action="store_true",
                     help="choose q/k/v/o candidates by true self-attention output loss")
+    ap.add_argument("--hybrid-guard", action="store_true",
+                    help="choose q/k by QK logits, then v/o by attention output loss")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -508,7 +576,8 @@ def main():
                    snc_guard=not args.no_snc_guard,
                    include_lm_head=args.include_lm_head,
                    qk_snc=args.qk_snc,
-                   attn_guard=args.attn_guard)
+                   attn_guard=args.attn_guard,
+                   hybrid_guard=args.hybrid_guard)
     model.save_pretrained(args.output_dir); tok.save_pretrained(args.output_dir)
     print(f"saved -> {args.output_dir}")
 
