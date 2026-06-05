@@ -155,6 +155,75 @@ def _qk_logits_mse(X, Wq, Wk, Wq_ref, Wk_ref, head_dim, device,
 
 
 @torch.no_grad()
+def _rope_qk_logits_mse(model, layer, lins, inps, kwargs, Wq, Wk, Wq_ref, Wk_ref,
+                        device, max_samples=1, max_seq=256):
+    head_dim = _infer_head_dim(model)
+    Wq = Wq.float().to(device)
+    Wk = Wk.float().to(device)
+    Wq_ref = Wq_ref.float().to(device)
+    Wk_ref = Wk_ref.float().to(device)
+    total = None
+    n = 0
+    for x in inps[:max_samples]:
+        hs = x.to(device)
+        if hs.shape[1] > max_seq:
+            hs = hs[:, :max_seq, :]
+        B, T, _ = hs.shape
+        if hasattr(layer, "input_layernorm") and layer.input_layernorm is not None:
+            attn_in = layer.input_layernorm(hs)
+        else:
+            attn_in = hs
+        pos_ids = kwargs.get("position_ids")
+        if pos_ids is None:
+            pos_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+        else:
+            pos_ids = pos_ids[:, :T].to(device)
+        cos, sin = model.model.rotary_emb(attn_in, pos_ids)
+
+        def _project(Wq_cur, Wk_cur):
+            q = attn_in.float() @ Wq_cur.t()
+            k = attn_in.float() @ Wk_cur.t()
+            n_q_heads = q.shape[-1] // head_dim
+            n_k_heads = k.shape[-1] // head_dim
+            if n_k_heads == 0 or n_q_heads % n_k_heads != 0:
+                return None, None
+            q = q.view(B, T, n_q_heads, head_dim).transpose(1, 2)
+            k = k.view(B, T, n_k_heads, head_dim).transpose(1, 2)
+            cos_u = cos.unsqueeze(1).float()
+            sin_u = sin.unsqueeze(1).float()
+            q_rot = (q * cos_u) + (_rotate_half(q) * sin_u)
+            k_rot = (k * cos_u) + (_rotate_half(k) * sin_u)
+            k_rot = k_rot.repeat_interleave(n_q_heads // n_k_heads, dim=1)
+            return q_rot, k_rot
+
+        q, k = _project(Wq, Wk)
+        q_ref, k_ref = _project(Wq_ref, Wk_ref)
+        if q is None:
+            return float("inf")
+        logits = torch.einsum("bhtd,bhsd->bhts", q, k) * (head_dim ** -0.5)
+        ref = torch.einsum("bhtd,bhsd->bhts", q_ref, k_ref) * (head_dim ** -0.5)
+        valid = torch.ones((T, T), device=device, dtype=torch.bool).tril()
+        attn_mask = _crop_mask(kwargs.get("attention_mask"), T, device)
+        if attn_mask is not None and attn_mask.dim() >= 4:
+            valid_b = valid[None, None, :, :] & torch.isfinite(attn_mask)
+        else:
+            valid_b = valid[None, None, :, :]
+        err = (logits - ref).pow(2)
+        cur = err.masked_select(valid_b.expand_as(err)).mean()
+        total = cur if total is None else total + cur
+        n += 1
+    if total is None:
+        return float("inf")
+    return (total / max(n, 1)).item()
+
+
+def _rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+@torch.no_grad()
 def _select_qk_pair(model, lins, preps, X_by_name, qk_alphas, bits, group_size,
                     p, lam, beta, device):
     q_name, k_name = _qk_proj_names(lins)
@@ -200,6 +269,62 @@ def _select_qk_pair(model, lins, preps, X_by_name, qk_alphas, bits, group_size,
             out["G"] = 0.0
         out["qk_guard"] = label
         out["qk_guard_loss"] = loss
+        return out
+
+    return {
+        q_name: Wq,
+        k_name: Wk,
+    }, {
+        q_name: _info(q_info, use_q),
+        k_name: _info(k_info, use_k),
+    }
+
+
+@torch.no_grad()
+def _select_rope_qk_pair(model, layer, lins, preps, inps, kwargs, qk_alphas,
+                         bits, group_size, p, lam, beta, device):
+    q_name, k_name = _qk_proj_names(lins)
+    if q_name not in preps or k_name not in preps:
+        return {}, {}
+    if q_name not in qk_alphas or k_name not in qk_alphas:
+        return {}, {}
+
+    q_p = preps[q_name]
+    k_p = preps[k_name]
+    q_base, _ = awq_apply_prepared(q_p, use_snc=False)
+    k_base, _ = awq_apply_prepared(k_p, use_snc=False)
+    q_snc, q_info = awq_apply_prepared(
+        q_p, use_snc=True, p=p, lam=lam, beta=beta, snc_guard=False,
+        alpha_sig=qk_alphas[q_name][0], alpha_noi=qk_alphas[q_name][1])
+    k_snc, k_info = awq_apply_prepared(
+        k_p, use_snc=True, p=p, lam=lam, beta=beta, snc_guard=False,
+        alpha_sig=qk_alphas[k_name][0], alpha_noi=qk_alphas[k_name][1])
+
+    Wq_ref = lins[q_name].weight.data
+    Wk_ref = lins[k_name].weight.data
+    candidates = [
+        ("base/base", q_base, k_base, False, False),
+        ("snc/base", q_snc, k_base, True, False),
+        ("base/snc", q_base, k_snc, False, True),
+        ("snc/snc", q_snc, k_snc, True, True),
+    ]
+    scored = []
+    for label, Wq, Wk, use_q, use_k in candidates:
+        loss = _rope_qk_logits_mse(model, layer, lins, inps, kwargs, Wq, Wk,
+                                   Wq_ref, Wk_ref, device)
+        scored.append((loss, label, Wq, Wk, use_q, use_k))
+    loss, label, Wq, Wk, use_q, use_k = min(scored, key=lambda x: x[0])
+    score_msg = " ".join(f"{label_i}={loss_i:.4e}" for loss_i, label_i, *_ in scored)
+    print(f"    RoPE QK guard: choose={label} {score_msg}", flush=True)
+
+    def _info(src, accepted):
+        out = dict(src)
+        out["snc_accepted"] = accepted
+        if not accepted:
+            out["n_flips"] = 0
+            out["G"] = 0.0
+        out["rope_qk_guard"] = label
+        out["rope_qk_guard_loss"] = loss
         return out
 
     return {
@@ -333,7 +458,7 @@ def _select_attention_block(model, layer, lins, preps, inps, kwargs, qk_alphas,
 @torch.no_grad()
 def _select_hybrid_attention_block(model, layer, lins, preps, X_by_name, inps,
                                    kwargs, qk_alphas, bits, group_size, p, lam,
-                                   beta, device):
+                                   beta, device, rope_qk_guard=False):
     """Use QK-logit guard for q/k, then true attention-output guard for v/o.
 
     The full attention guard is a good local metric but can move q/k away from
@@ -341,9 +466,14 @@ def _select_hybrid_attention_block(model, layer, lins, preps, X_by_name, inps,
     stronger q/k decision and only uses the full attention path for value/output
     mixing.
     """
-    qk_weights, qk_infos = _select_qk_pair(
-        model, lins, preps, X_by_name, qk_alphas, bits, group_size,
-        p, lam, beta, device)
+    if rope_qk_guard:
+        qk_weights, qk_infos = _select_rope_qk_pair(
+            model, layer, lins, preps, inps, kwargs, qk_alphas,
+            bits, group_size, p, lam, beta, device)
+    else:
+        qk_weights, qk_infos = _select_qk_pair(
+            model, lins, preps, X_by_name, qk_alphas, bits, group_size,
+            p, lam, beta, device)
     names = _attn_proj_names(lins)
     vo_names = [names[k] for k in ("v", "o") if k in names and names[k] in preps]
     if not vo_names:
@@ -405,7 +535,8 @@ class _Catcher(nn.Module):
 @torch.no_grad()
 def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42,
                    lam=1.0, beta=1.0, snc_guard=True, include_lm_head=False,
-                   qk_snc=False, attn_guard=False, hybrid_guard=False):
+                   qk_snc=False, attn_guard=False, hybrid_guard=False,
+                   rope_qk_guard=False):
     # AWQ token subsampling uses torch.randperm in this function and in awq.py.
     # Reset once per quantization run so independently launched AWQ/SNC runs
     # see the same calibration subsets.
@@ -462,11 +593,16 @@ def quantize_model(model, calib, bits, group_size, use_snc, p, device, seed=42,
         if use_snc and qk_snc and hybrid_guard:
             qk_weights, qk_infos = _select_hybrid_attention_block(
                 model, layer, lins, preps, X_by_name, inps, kwargs, qk_alphas,
-                bits, group_size, p, lam, beta, device)
+                bits, group_size, p, lam, beta, device,
+                rope_qk_guard=rope_qk_guard)
         elif use_snc and qk_snc and attn_guard:
             qk_weights, qk_infos = _select_attention_block(
                 model, layer, lins, preps, inps, kwargs, qk_alphas,
                 p, lam, beta, device)
+        elif use_snc and qk_snc and rope_qk_guard:
+            qk_weights, qk_infos = _select_rope_qk_pair(
+                model, layer, lins, preps, inps, kwargs, qk_alphas,
+                bits, group_size, p, lam, beta, device)
         elif use_snc and qk_snc:
             qk_weights, qk_infos = _select_qk_pair(
                 model, lins, preps, X_by_name, qk_alphas, bits, group_size,
@@ -559,6 +695,8 @@ def main():
                     help="choose q/k/v/o candidates by true self-attention output loss")
     ap.add_argument("--hybrid-guard", action="store_true",
                     help="choose q/k by QK logits, then v/o by attention output loss")
+    ap.add_argument("--rope-qk-guard", action="store_true",
+                    help="choose q/k by RoPE-aware causal QK logit loss")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -577,7 +715,8 @@ def main():
                    include_lm_head=args.include_lm_head,
                    qk_snc=args.qk_snc,
                    attn_guard=args.attn_guard,
-                   hybrid_guard=args.hybrid_guard)
+                   hybrid_guard=args.hybrid_guard,
+                   rope_qk_guard=args.rope_qk_guard)
     model.save_pretrained(args.output_dir); tok.save_pretrained(args.output_dir)
     print(f"saved -> {args.output_dir}")
 

@@ -29,6 +29,8 @@ def main():
                     help="choose q/k/v/o candidates by true self-attention output loss")
     ap.add_argument("--hybrid-guard", action="store_true",
                     help="choose q/k by QK logits, then v/o by attention output loss")
+    ap.add_argument("--rope-qk-guard", action="store_true",
+                    help="choose q/k by RoPE-aware causal QK logit loss")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--datasets", nargs="+", default=["wikitext2", "c4"])
     ap.add_argument("--tasks", default="")
@@ -60,7 +62,8 @@ def main():
                        include_lm_head=args.include_lm_head,
                        qk_snc=args.qk_snc,
                        attn_guard=args.attn_guard,
-                       hybrid_guard=args.hybrid_guard)
+                       hybrid_guard=args.hybrid_guard,
+                       rope_qk_guard=args.rope_qk_guard)
         model.cuda()
 
     for d in args.datasets:
